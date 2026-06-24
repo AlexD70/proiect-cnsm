@@ -38,6 +38,7 @@ from scapy.layers.inet import IP, UDP
 from scapy.layers.tftp import TFTP, TFTP_ACK, TFTP_DATA, TFTP_RRQ, TFTP_WRQ
 from scapy.sendrecv import send, sr
 from enum import Enum
+import select
 
 SERVER_IP = "192.168.30.90"
 CLIENT_IP = "192.168.40.50"
@@ -264,15 +265,17 @@ def increase_data_to_513bytes(
     last_ack = -1
     last_block = -1
     server_address = (SERVER_IP, TFTP_PORT)
+    receive_ack_from_client_again = False
 
     while True:
-        if reset:
+        if reset  and not receive_ack_from_client_again:
             changed_size = -1 # -1 means not yet, 0 means change next data packet (RRQ), 1 for WRQ, 2 means done
             server_address = (SERVER_IP, TFTP_PORT)
             reset = False
             connected = False
             last_ack = -1
             last_block = -1
+            acks = 0
 
         if connected:
             request, client_address = proxy.receive(proxy_to_client_socket)
@@ -286,8 +289,14 @@ def increase_data_to_513bytes(
         req_opcode = proxy.get_opcode(request)
 
         if req_opcode == OPCode.ACK.value:
-            if proxy.get_blocknumber(request) == last_ack:
+            if proxy.get_blocknumber(request) == last_ack and not receive_ack_from_client_again:
                 reset = True
+            else:
+                acks += 1
+
+            if acks == 2:
+                receive_ack_from_client_again = False
+                acks = 0
         elif req_opcode == OPCode.RRQ.value:
             changed_size = 0
         elif req_opcode == OPCode.WRQ.value:
@@ -301,14 +310,14 @@ def increase_data_to_513bytes(
                 data = request[4:]
 
                 padding_needed = 550 - len(data)
-                data += b" " * padding_needed
+                data += b" " * (padding_needed)
                 # now rebuild the packet and then send to server
                 request = req_opcode.to_bytes(2, "big") + bn.to_bytes(2, "big") + data
                 changed_size = 2
 
         proxy.forward(proxy_to_server_socket, server_address, request)
 
-        if not reset:
+        if not reset and not receive_ack_from_client_again:
             response, server_address = proxy.receive(proxy_to_server_socket)
             
             if proxy.get_opcode(response) == OPCode.DATA.value:
@@ -321,16 +330,109 @@ def increase_data_to_513bytes(
                     opcode = proxy.get_opcode(response)
 
                     padding_needed = 550 - len(data)
-                    data += b" " * padding_needed
+                    data += b" " * (padding_needed)
                     response = opcode.to_bytes(2, "big") + bn.to_bytes(2, "big") + data
                     changed_size = 2
+                    receive_ack_from_client_again = True
             elif proxy.get_opcode(response) == OPCode.ACK.value:
                 if proxy.get_blocknumber(response) == last_block:
                     reset = True
             elif proxy.get_opcode(response) == OPCode.ERROR.value:
                 reset = True
 
+            receive_ack_from_client_again = False
             proxy.forward(proxy_to_client_socket, client_address, response)
+
+def increase_data_over512(
+    proxy: Proxy,
+    initial_proxy_socket: socket,
+    proxy_to_server_socket: socket,
+    proxy_to_client_socket: socket,
+) -> None:
+    connected = False
+    last_ack = -1
+    last_block = -1
+    server_address = (SERVER_IP, TFTP_PORT)
+    client_address = None
+    changed_size = -1 # -1 means not yet, 0 means change next data packet (RRQ), 1 for WRQ, 2 means done
+
+    print("--------------------------------------------------------------")
+    print("Waiting for the request from client. Only the first data packet will be changed.")
+    print("--------------------------------------------------------------\n")
+    
+    while True:
+
+        sockets_to_watch = [proxy_to_server_socket]
+        if not connected:
+            sockets_to_watch.append(initial_proxy_socket)
+        else:
+            sockets_to_watch.append(proxy_to_client_socket)
+
+        readable, _, _ = select.select(sockets_to_watch, [], [])
+
+        for sock in readable:
+            
+            if sock == initial_proxy_socket or sock == proxy_to_client_socket:
+                request, addr = proxy.receive(sock)
+                if not connected:
+                    client_address = addr
+                    connected = True
+                
+                req_opcode = proxy.get_opcode(request)
+                
+                if req_opcode == OPCode.ACK.value:
+                    if proxy.get_blocknumber(request) == last_ack:
+                        pass
+                        
+                elif req_opcode == OPCode.DATA.value:
+                    if len(request) - 4 < 512:
+                        last_block = proxy.get_blocknumber(request)
+
+                    if changed_size == 1:
+                        bn = proxy.get_blocknumber(request)
+                        data = request[4:]
+
+                        padding_needed = 550 - len(data)
+                        data += b" " * (padding_needed)
+                        # now rebuild the packet and then send to server
+                        request = req_opcode.to_bytes(2, "big") + bn.to_bytes(2, "big") + data
+                        changed_size = 2
+                elif req_opcode == OPCode.RRQ.value:
+                    changed_size = 0
+                elif req_opcode == OPCode.WRQ.value:
+                    changed_size = 1
+
+                # Forward client packet to server
+                proxy.forward(proxy_to_server_socket, server_address, request)
+
+            # --- HANDLE SERVER TRAFFIC (Crucial for unexpected retransmissions) ---
+            elif sock == proxy_to_server_socket:
+                response, addr = proxy.receive(proxy_to_server_socket)
+                server_address = addr  # Track dynamic ephemeral ports assigned by server
+                
+                res_opcode = proxy.get_opcode(response)
+
+                if res_opcode == OPCode.DATA.value:
+                    if len(response) - 4 < 512:
+                        last_ack = proxy.get_blocknumber(response)
+
+                    if changed_size == 0:
+                        bn = proxy.get_blocknumber(response)
+                        data = response[4:]
+                        opcode = proxy.get_opcode(response)
+
+                        padding_needed = 550 - len(data)
+                        data += b" " * padding_needed
+                        response = opcode.to_bytes(2, "big") + bn.to_bytes(2, "big") + data
+                        changed_size = 2
+
+                elif res_opcode == OPCode.ACK.value:
+                    if proxy.get_blocknumber(response) == last_block:
+                        pass
+
+                # Forward server packet to client if we know who the client is
+                if client_address:
+                    proxy.forward(proxy_to_client_socket, client_address, response)
 
 def change_bn_of_ack(
     proxy: Proxy,
@@ -339,68 +441,92 @@ def change_bn_of_ack(
     proxy_to_client_socket: socket,
     behaviour_on_wrq: int
 ) -> None:
-
-    reset = False
+    reset = True  # Start as True to trigger the initial setup block
     connected = False
     last_ack = -1
     last_block = -1
     server_address = (SERVER_IP, TFTP_PORT)
-
-    # only modifies the BN of the first ACK after a DATA packet
+    client_address = None
+    modify_bn = 0
 
     while True:
         if reset:
             server_address = (SERVER_IP, TFTP_PORT)
+            client_address = None
             reset = False
             connected = False
             last_ack = -1
             last_block = -1
-            modify_bn = 0 # 0 - not yet, 1 - modify next ack, 2 - done, 3 - wait one ack, then modify
+            modify_bn = 0  # 0 - not yet, 1 - modify next ack, 2 - done, 3 - wait one ack, then modify
 
-        if connected:
-            request, client_address = proxy.receive(proxy_to_client_socket)
-        else:
             print("--------------------------------------------------------------")
             print("Waiting for the request from client.")
-            if(behaviour_on_wrq == 0):
+            if behaviour_on_wrq == 0:
                 print("On both RRQ and WRQ, the BN will be increased.")
             else:
                 print("On RRQ, the BN will be increased, but on WRQ, it will be decreased.")
             print("--------------------------------------------------------------\n")
-            request, client_address = proxy.receive(initial_proxy_socket)
-            connected = True
 
-        req_opcode = proxy.get_opcode(request)
-        if req_opcode == OPCode.ACK.value:
-            if proxy.get_blocknumber(request) == last_ack and modify_bn == 2:
-                reset = True
+        # 1. Determine which sockets we need to watch right now
+        sockets_to_watch = [proxy_to_server_socket]
+        if not connected:
+            sockets_to_watch.append(initial_proxy_socket)
+        else:
+            sockets_to_watch.append(proxy_to_client_socket)
 
-            if(modify_bn == 1):
-                bn = proxy.get_blocknumber(request) + 1
-                request = req_opcode.to_bytes(2, "big") + bn.to_bytes(2, "big")
-                modify_bn = 2
-        elif req_opcode == OPCode.DATA.value:
-            if len(request) - 4 < 512:
-                last_block = proxy.get_blocknumber(request)
-        elif req_opcode == OPCode.RRQ.value:
-            modify_bn = 1
-        elif req_opcode == OPCode.WRQ.value:
-            modify_bn = 3
+        # 2. Wait until at least one socket receives data
+        readable, _, _ = select.select(sockets_to_watch, [], [])
 
-        proxy.forward(proxy_to_server_socket, server_address, request)
+        for sock in readable:
+            
+            # --- HANDLE CLIENT TRAFFIC ---
+            if sock == initial_proxy_socket or sock == proxy_to_client_socket:
+                request, addr = proxy.receive(sock)
+                if not connected:
+                    client_address = addr
+                    connected = True
+                
+                req_opcode = proxy.get_opcode(request)
+                
+                if req_opcode == OPCode.ACK.value:
+                    if proxy.get_blocknumber(request) == last_ack and modify_bn == 2:
+                        reset = True
 
-        if not reset:
-            response, server_address = proxy.receive(proxy_to_server_socket)
-            if proxy.get_opcode(response) == OPCode.DATA.value:
-                if len(response) - 4 < 512:
-                    last_ack = proxy.get_blocknumber(response)
-            elif proxy.get_opcode(response) == OPCode.ACK.value:
-                if proxy.get_blocknumber(response) == last_block:
+                    if modify_bn == 1:
+                        bn = proxy.get_blocknumber(request) + 1
+                        request = req_opcode.to_bytes(2, "big") + bn.to_bytes(2, "big")
+                        modify_bn = 2
+                        
+                elif req_opcode == OPCode.DATA.value:
+                    if len(request) - 4 < 512:
+                        last_block = proxy.get_blocknumber(request)
+                elif req_opcode == OPCode.RRQ.value:
+                    modify_bn = 1
+                elif req_opcode == OPCode.WRQ.value:
+                    modify_bn = 3
+
+                # Forward client packet to server
+                proxy.forward(proxy_to_server_socket, server_address, request)
+
+            # --- HANDLE SERVER TRAFFIC (Crucial for unexpected retransmissions) ---
+            elif sock == proxy_to_server_socket:
+                response, addr = proxy.receive(proxy_to_server_socket)
+                server_address = addr  # Track dynamic ephemeral ports assigned by server
+                
+                res_opcode = proxy.get_opcode(response)
+
+                if res_opcode == OPCode.DATA.value:
+                    if len(response) - 4 < 512:
+                        last_ack = proxy.get_blocknumber(response)
+                elif res_opcode == OPCode.ACK.value:
+                    if proxy.get_blocknumber(response) == last_block:
+                        reset = True
+                elif res_opcode == OPCode.ERROR.value:
                     reset = True
-            elif proxy.get_opcode(response) == OPCode.ERROR.value:
-                reset = True
 
-            proxy.forward(proxy_to_client_socket, client_address, response)
+                # Forward server packet to client if we know who the client is
+                if client_address:
+                    proxy.forward(proxy_to_client_socket, client_address, response)
 
 def handle_normal_transmission(
     proxy: Proxy,
@@ -482,7 +608,7 @@ def main() -> None:
             proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
         )
     elif num == 1:
-        increase_data_to_513bytes(
+        increase_data_over512(
             proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
         )
     elif num == 2:
