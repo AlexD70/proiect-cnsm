@@ -527,7 +527,68 @@ def change_bn_of_ack(
                 # Forward server packet to client if we know who the client is
                 if client_address:
                     proxy.forward(proxy_to_client_socket, client_address, response)
+def drop_data_and_spoof_ack(
+    proxy: Proxy,
+    initial_proxy_socket: socket,
+    proxy_to_server_socket: socket,
+    proxy_to_client_socket: socket,
+) -> None:
+    """Implements the 6th Optional case:
+    The Proxy doesnt redirect the DATA packet to the server, instead it sends
+    an ACK to the sender"""
 
+    connected = False;
+    server_address = (SERVER_IP, TFTP_PORT)
+    client_address = None
+    packet_dropped = False
+
+    print("------------------------------------------------------------------------------")
+    print("Wainting for the RRQ request from the client")
+    print("The first DATA packet will be dropped and the server will receive a fake ACK")
+    print("------------------------------------------------------------------------------")
+
+    while True:
+        sockets_to_watch = [proxy_to_server_socket]
+        if not connected:
+            sockets_to_watch.append(initial_proxy_socket)
+        else:
+            sockets_to_watch.append(proxy_to_client_socket)
+        
+        readable, _, _ = select.select(sockets_to_watch, [],[])
+
+        for sock in readable:
+            # traffic from client
+            if sock == initial_proxy_socket or sock == proxy_to_client_socket:
+                request, addr = proxy.receive(sock)
+                if not connected:
+                    client_address = addr
+                    connected = True
+
+                # redirect the request from the client to the server
+                proxy.forward(proxy_to_server_socket, server_address, request)
+
+            # traffic from the server
+            elif sock == proxy_to_server_socket:
+                response, addr = proxy.receive(proxy_to_server_socket)
+                server_address = addr
+
+                res_opcode = proxy.get_opcode(response)
+
+                #intercepting DATA packet
+
+                if res_opcode == OPCode.DATA.value and not packet_dropped:
+                    bn = proxy.get_blocknumber(response)
+                    print(f"\n[!] PROXY: DATA packet with BN={bn} from server.")
+                    print("[!] Packet DROPPED")
+
+                    fake_ack = (OPCode.ACK.value).to_bytes(2, "big") + bn.to_bytes(2, "big")
+                    print(f"[!] Sending fake ACK with BN={bn} to server.\n")
+                    proxy.forward(proxy_to_server_socket, server_address, fake_ack)
+
+                    packet_dropped = True
+                else:
+                    if client_address:
+                        proxy.forward(proxy_to_client_socket, client_address, response)
 def handle_normal_transmission(
     proxy: Proxy,
     initial_proxy_socket: socket,
@@ -629,6 +690,9 @@ def main() -> None:
     elif num == 5:
         print("not implemented yet..")
     elif num == 6:
+        drop_data_and_spoof_ack(
+            proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
+        )
         print("not implemented yet..")
     elif num == 7:
         print("not implemented yet..")
