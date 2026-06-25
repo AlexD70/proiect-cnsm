@@ -563,7 +563,10 @@ def drop_data_and_spoof_ack(
                 if not connected:
                     client_address = addr
                     connected = True
+                req_opcode = proxy.get_opcode(request)
 
+                if req_opcode == OPCode.RRQ.value:
+                    server_address = (SERVER_IP, TFTP_PORT)
                 # redirect the request from the client to the server
                 proxy.forward(proxy_to_server_socket, server_address, request)
 
