@@ -39,6 +39,7 @@ from scapy.layers.tftp import TFTP, TFTP_ACK, TFTP_DATA, TFTP_RRQ, TFTP_WRQ
 from scapy.sendrecv import send, sr
 from enum import Enum
 import select
+import time
 
 SERVER_IP = "192.168.30.90"
 CLIENT_IP = "192.168.40.50"
@@ -592,6 +593,73 @@ def drop_data_and_spoof_ack(
                 else:
                     if client_address:
                         proxy.forward(proxy_to_client_socket, client_address, response)
+
+
+def delay_last_data_packet(
+    proxy: Proxy,
+    initial_proxy_socket: socket,
+    proxy_to_server_socket: socket,
+    proxy_to_client_socket: socket,
+) -> None:
+    """Implementing the 5th optional scenario
+    Requesting a file larger than 512 bytes and delaying
+    the transmission of last DATA packet by 15 seconds in RRQ traffic"""
+
+    connected = False
+    server_address = (SERVER_IP, TFTP_PORT)
+    client_address = None
+    last_packet_delayed = False
+
+    print("--------------------------------------------")
+    print("Waiting for the RRQ request from the client")
+    print('The last DATA will be delayed for 15 seconds')
+    print("--------------------------------------------\n")
+
+    while True:
+        sockets_to_watch = [proxy_to_server_socket]
+        if not connected:
+            sockets_to_watch.append(initial_proxy_socket)
+        else:
+            sockets_to_watch.append(proxy_to_client_socket)
+
+        readable, _, _ = select.select(sockets_to_watch, [], [])
+
+        for sock in readable:
+            #traffic from client
+            if sock == initial_proxy_socket or sock == proxy_to_client_socket:
+                request, addr = proxy.receive(sock)
+                if not connected:
+                    client_address = addr
+                    connected = True
+
+                req_opcode = proxy.get_opcode(request)
+
+                if req_opcode == OPCode.RRQ.value:
+                    server_address = (SERVER_IP, TFTP_PORT)
+                    last_packet_delayed = False
+
+                proxy.forward(proxy_to_server_socket, server_address, request)
+
+            #traffic from server
+            elif sock == proxy_to_server_socket:
+                response, addr = proxy.receive(proxy_to_server_socket)
+                server_address = addr
+
+                res_opcode = proxy.get_opcode(response)
+
+                if res_opcode == OPCode.DATA.valua:
+                    payload_length = len(response) - 4 #subtracting the 4 bytes of the header
+
+                    if payload_length < 512 and not last_packet_delayed:
+                        bn = proxy.get_blocknumber(response)
+                        print(f"\n[!] PROXY: Last DATA packet etected(BN={bn}, {payload_length} bytes payload).")
+                        print("[!] Delaying the transmission for 15 seconds\n")
+
+                        time.sleep(15)
+                        print("[!] 15 secconds passed")
+                        last_packet_delayed = True
+                if client_address:
+                    proxy.forward(proxy_to_client_socket, client_address, response)
 def handle_normal_transmission(
     proxy: Proxy,
     initial_proxy_socket: socket,
@@ -696,9 +764,10 @@ def main() -> None:
         drop_data_and_spoof_ack(
             proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
         )
-        print("not implemented yet..")
     elif num == 7:
-        print("not implemented yet..")
+        delay_last_data_packet(
+            proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
+        )
 
     print("End of transmission. \n")
 
