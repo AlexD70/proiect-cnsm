@@ -788,6 +788,65 @@ def delay_ack_packet_rrq(
 
                 if client_address:
                     proxy.forward(proxy_to_client_socket, client_address, response)
+def delay_data_packet_rrq(
+    proxy: Proxy,
+    initial_proxy_socket: socket,
+    proxy_to_server_socket: socket,
+    proxy_to_client_socket: socket,
+) -> None:
+    "Delaying the transmission of DATA packet for 25 seconds in RRQ traffic"
+
+    connected = False
+    server_address = (SERVER_IP, TFTP_PORT)
+    client_address = None
+    data_delayed = False
+    print("-----------------------------------------------------")
+    print("Waiting for RRQ request from client.")
+    print("the first DATA packet will be delayed for 25 seconds")
+    print("-----------------------------------------------------")
+
+    while True:
+        sockets_to_watch = [proxy_to_server_socket]
+        if not connected:
+            sockets_to_watch.append(initial_proxy_socket)
+        else:
+            sockets_to_watch.append(proxy_to_client_socket)
+
+        readable, _, _ = select.select(sockets_to_watch, [], [])
+
+        for sock in readable:
+            if sock == initial_proxy_socket or sock == proxy_to_client_socket:
+                request, addr = proxy.receive(sock)
+                if not connected:
+                    client_address = addr
+                    connected = True
+
+                req_opcode = proxy.get_opcode(request)
+
+                if req_opcode == OPCode.RRQ.value:
+                    server_address = (SERVER_IP, TFTP_PORT)
+                    data_delayed = False
+                elif req_opcode == OPCode.WRQ.value:
+                    server_address = (SERVER_IP, TFTP_PORT)
+
+                proxy.forward(proxy_to_server_socket, server_address, request)
+            elif sock == proxy_to_server_socket:
+                response, addr = proxy.receive(proxy_to_server_socket)
+                server_address = addr
+
+                res_opcode = proxy.get_opcode(response)
+
+                if res_opcode == OPCode.DATA.value and not data_delayed:
+                    bn = proxy.get_blocknumber(response)
+                    print(f"\n[!] Proxy: Intercepted DATA packet (BN={bn}) from server.")
+                    print("[!] Delaying the transmission for 25 seconds\n")
+
+                    time.sleep(25)
+                    print("[!] 25 seconds passed.")
+                    data_delayed = True
+                
+                if client_address:
+                    proxy.forward(proxy_to_client_socket,client_address, response)
 def handle_normal_transmission(
     proxy: Proxy,
     initial_proxy_socket: socket,
@@ -883,7 +942,9 @@ def main() -> None:
             proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket, resp
         )
     elif num == 3:
-        print("not implemented yet..")
+        delay_data_packet_rrq(
+            proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
+        )
     elif num == 4:
         delay_ack_packet_rrq(
             proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
@@ -917,7 +978,7 @@ def read_user_input() -> int:
         print("0: Normal transmission")
         print("1: Increase data block size over 512bytes")
         print("2: Change BN of first ACK after DATA packet")
-        print("3: faulty situation 3")
+        print("3: Delaying DATA packet for 25 seconds in RRQ")
         print("4: Delaying ACK for 25 seconds in RRQ")
         print("5: Replacing DATA packet with ERROR packet in WRQ")
         print("6: Drop DATA and send a fake ACK to the server")
