@@ -320,7 +320,7 @@ def increase_data_to_513bytes(
 
         if not reset and not receive_ack_from_client_again:
             response, server_address = proxy.receive(proxy_to_server_socket)
-            
+
             if proxy.get_opcode(response) == OPCode.DATA.value:
                 if len(response) - 4 < 512:
                     last_ack = proxy.get_blocknumber(response)
@@ -360,7 +360,7 @@ def increase_data_over512(
     print("--------------------------------------------------------------")
     print("Waiting for the request from client. Only the first data packet will be changed.")
     print("--------------------------------------------------------------\n")
-    
+
     while True:
 
         sockets_to_watch = [proxy_to_server_socket]
@@ -372,19 +372,19 @@ def increase_data_over512(
         readable, _, _ = select.select(sockets_to_watch, [], [])
 
         for sock in readable:
-            
+
             if sock == initial_proxy_socket or sock == proxy_to_client_socket:
                 request, addr = proxy.receive(sock)
                 if not connected:
                     client_address = addr
                     connected = True
-                
+
                 req_opcode = proxy.get_opcode(request)
-                
+
                 if req_opcode == OPCode.ACK.value:
                     if proxy.get_blocknumber(request) == last_ack:
                         pass
-                        
+
                 elif req_opcode == OPCode.DATA.value:
                     if len(request) - 4 < 512:
                         last_block = proxy.get_blocknumber(request)
@@ -410,7 +410,7 @@ def increase_data_over512(
             elif sock == proxy_to_server_socket:
                 response, addr = proxy.receive(proxy_to_server_socket)
                 server_address = addr  # Track dynamic ephemeral ports assigned by server
-                
+
                 res_opcode = proxy.get_opcode(response)
 
                 if res_opcode == OPCode.DATA.value:
@@ -479,16 +479,16 @@ def change_bn_of_ack(
         readable, _, _ = select.select(sockets_to_watch, [], [])
 
         for sock in readable:
-            
+
             # --- HANDLE CLIENT TRAFFIC ---
             if sock == initial_proxy_socket or sock == proxy_to_client_socket:
                 request, addr = proxy.receive(sock)
                 if not connected:
                     client_address = addr
                     connected = True
-                
+
                 req_opcode = proxy.get_opcode(request)
-                
+
                 if req_opcode == OPCode.ACK.value:
                     if proxy.get_blocknumber(request) == last_ack and modify_bn == 2:
                         reset = True
@@ -497,7 +497,7 @@ def change_bn_of_ack(
                         bn = proxy.get_blocknumber(request) + 1
                         request = req_opcode.to_bytes(2, "big") + bn.to_bytes(2, "big")
                         modify_bn = 2
-                        
+
                 elif req_opcode == OPCode.DATA.value:
                     if len(request) - 4 < 512:
                         last_block = proxy.get_blocknumber(request)
@@ -513,7 +513,7 @@ def change_bn_of_ack(
             elif sock == proxy_to_server_socket:
                 response, addr = proxy.receive(proxy_to_server_socket)
                 server_address = addr  # Track dynamic ephemeral ports assigned by server
-                
+
                 res_opcode = proxy.get_opcode(response)
 
                 if res_opcode == OPCode.DATA.value:
@@ -554,7 +554,7 @@ def drop_data_and_spoof_ack(
             sockets_to_watch.append(initial_proxy_socket)
         else:
             sockets_to_watch.append(proxy_to_client_socket)
-        
+
         readable, _, _ = select.select(sockets_to_watch, [],[])
 
         for sock in readable:
@@ -647,7 +647,7 @@ def delay_last_data_packet(
 
                 res_opcode = proxy.get_opcode(response)
 
-                if res_opcode == OPCode.DATA.valua:
+                if res_opcode == OPCode.DATA.value:
                     payload_length = len(response) - 4 #subtracting the 4 bytes of the header
 
                     if payload_length < 512 and not last_packet_delayed:
@@ -658,6 +658,71 @@ def delay_last_data_packet(
                         time.sleep(15)
                         print("[!] 15 secconds passed")
                         last_packet_delayed = True
+                if client_address:
+                    proxy.forward(proxy_to_client_socket, client_address, response)
+def replace_data_with_error_wrq(
+    proxy: Proxy,
+    initial_proxy_socket: socket,
+    proxy_to_server_socket: socket,
+    proxy_to_client_socket: socket,
+) -> None:
+    """Implementing the 5th situation:
+        Replacing a DATA packet with an ERROR packet in WRQ traffic"""
+
+    connected = False
+    server_address = (SERVER_IP, TFTP_PORT)
+    client_address = None
+    is_wrq = False
+    packet_replaced = False
+
+    print("---------------------------------------------------------")
+    print("Waiting for the WRQ request from the client")
+    print("The first DATA packet will be replaced with an ERROR one")
+    print("---------------------------------------------------------")
+
+    while True:
+        sockets_to_watch = [proxy_to_server_socket]
+        if not connected:
+            sockets_to_watch.append(initial_proxy_socket)
+        else:
+            sockets_to_watch.append(proxy_to_client_socket)
+        readable, _, _ = select.select(sockets_to_watch, [], [])
+
+        for sock in readable:
+            if sock == initial_proxy_socket or sock == proxy_to_client_socket:
+                request, addr = proxy.receive(sock)
+                if not connected:
+                    client_address = addr
+                    connected = True
+
+                req_opcode = proxy.get_opcode(request)
+
+                if req_opcode == OPCode.WRQ.value:
+                    server_address = (SERVER_IP, TFTP_PORT)
+                    is_wrq = True
+                    packet_replaced = False
+                
+                elif req_opcode == OPCode.RRQ.value:
+                    server_address = (SERVER_IP, TFTP_PORT)
+                    is_wrq = False
+
+                if is_wrq and req_opcode == OPCode.DATA.value and not packet_replaced:
+                    bn = proxy.get_blocknumber(request)
+                    print(f"\n[!] PROXY: DATA packet intercepted (BN={bn}) from Client.")
+                    print("[!] DATA packet dropped and replaced with an ERROR one")
+
+                    err_code = 0 # code 0 means "Not defined, see error message"
+                    err_msg = b"Proxy replaced DATA packet with ERROR"
+                    err_packet= (OPCode.ERROR.value).to_bytes(2, "big") + err_code.to_bytes(2, "big") + err_msg + b"\x00"
+
+                    proxy.forward(proxy_to_server_socket, server_address, err_packet)
+                    packet_replaced = True
+                else:
+                    proxy.forward(proxy_to_server_socket, server_address, request)
+            elif sock == proxy_to_server_socket:
+                response, addr = proxy.receive(proxy_to_server_socket)
+                server_address = addr
+
                 if client_address:
                     proxy.forward(proxy_to_client_socket, client_address, response)
 def handle_normal_transmission(
@@ -759,7 +824,9 @@ def main() -> None:
     elif num == 4:
         print("not implemented yet..")
     elif num == 5:
-        print("not implemented yet..")
+        replace_data_with_error_wrq(
+            proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
+        )
     elif num == 6:
         drop_data_and_spoof_ack(
             proxy, initial_proxy_socket, proxy_to_server_socket, proxy_to_client_socket
@@ -770,6 +837,7 @@ def main() -> None:
         )
 
     print("End of transmission. \n")
+
 
 
 def read_user_input() -> int:
@@ -786,7 +854,7 @@ def read_user_input() -> int:
         print("2: Change BN of first ACK after DATA packet")
         print("3: faulty situation 3")
         print("4: faulty situation 4")
-        print("5: faulty situation 5")
+        print("5: Replacing DATA packet with ERROR packet in WRQ")
         print("6: faulty situation 6")
         print("7: faulty situation 7")
         print()  # prints empty line on console
