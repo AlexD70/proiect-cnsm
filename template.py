@@ -549,10 +549,10 @@ def drop_data_and_spoof_ack(
     print("------------------------------------------------------------------------------")
 
     while True:
-        sockets_to_watch = [proxy_to_server_socket]
-        if not connected:
-            sockets_to_watch.append(initial_proxy_socket)
-        else:
+        sockets_to_watch = [proxy_to_server_socket, initial_proxy_socket]
+        # always listen on the initial socket in expectance of an RRQ
+
+        if connected:
             sockets_to_watch.append(proxy_to_client_socket)
 
         readable, _, _ = select.select(sockets_to_watch, [],[])
@@ -561,6 +561,9 @@ def drop_data_and_spoof_ack(
             # traffic from client
             if sock == initial_proxy_socket or sock == proxy_to_client_socket:
                 request, addr = proxy.receive(sock)
+                if sock == initial_proxy_socket:
+                    connected = False
+
                 if not connected:
                     client_address = addr
                     connected = True
@@ -605,7 +608,9 @@ def delay_last_data_packet(
     Requesting a file larger than 512 bytes and delaying
     the transmission of last DATA packet by 15 seconds in RRQ traffic"""
 
+    packet_to_delay = None
     connected = False
+    start_time = 0
     server_address = (SERVER_IP, TFTP_PORT)
     client_address = None
     last_packet_delayed = False
@@ -616,6 +621,7 @@ def delay_last_data_packet(
     print("--------------------------------------------\n")
 
     while True:
+        now = time.time()
         sockets_to_watch = [proxy_to_server_socket]
         if not connected:
             sockets_to_watch.append(initial_proxy_socket)
@@ -625,6 +631,15 @@ def delay_last_data_packet(
         readable, _, _ = select.select(sockets_to_watch, [], [])
 
         for sock in readable:
+            if packet_to_delay is not None:
+                print(f"Time: {abs(now - start_time)}")
+                if(abs(now - start_time) < 15):
+                    dropthis, addr = proxy.receive(sock)
+                    continue
+                else:
+                    proxy.forward(proxy_to_client_socket, client_address, packet_to_delay)
+                    packet_to_delay = None
+
             #traffic from client
             if sock == initial_proxy_socket or sock == proxy_to_client_socket:
                 request, addr = proxy.receive(sock)
@@ -655,9 +670,10 @@ def delay_last_data_packet(
                         print(f"\n[!] PROXY: Last DATA packet etected(BN={bn}, {payload_length} bytes payload).")
                         print("[!] Delaying the transmission for 15 seconds\n")
 
-                        time.sleep(15)
-                        print("[!] 15 secconds passed")
+                        packet_to_delay = response
+                        start_time = time.time()
                         last_packet_delayed = True
+                        continue
                 if client_address:
                     proxy.forward(proxy_to_client_socket, client_address, response)
 def replace_data_with_error_wrq(
@@ -788,6 +804,7 @@ def delay_ack_packet_rrq(
 
                 if client_address:
                     proxy.forward(proxy_to_client_socket, client_address, response)
+
 def delay_data_packet_rrq(
     proxy: Proxy,
     initial_proxy_socket: socket,
@@ -797,6 +814,8 @@ def delay_data_packet_rrq(
     "Delaying the transmission of DATA packet for 25 seconds in RRQ traffic"
 
     connected = False
+    packet_to_delay = None
+    start_time = 0
     server_address = (SERVER_IP, TFTP_PORT)
     client_address = None
     data_delayed = False
@@ -806,13 +825,20 @@ def delay_data_packet_rrq(
     print("-----------------------------------------------------")
 
     while True:
+        now = time.time()
         sockets_to_watch = [proxy_to_server_socket]
         if not connected:
             sockets_to_watch.append(initial_proxy_socket)
         else:
             sockets_to_watch.append(proxy_to_client_socket)
 
-        readable, _, _ = select.select(sockets_to_watch, [], [])
+        readable, _, _ = select.select(sockets_to_watch, [], [], abs(now - start_time))
+
+        print(f"Time: {abs(now - start_time)}.")
+        if (packet_to_delay is not None) and (abs(now - start_time) >= 25):
+            print("25 seconds passed. forwarding delayed packet")
+            proxy.forward(proxy_to_client_socket, client_address, packet_to_delay)
+            packet_to_delay = None
 
         for sock in readable:
             if sock == initial_proxy_socket or sock == proxy_to_client_socket:
@@ -841,11 +867,13 @@ def delay_data_packet_rrq(
                     print(f"\n[!] Proxy: Intercepted DATA packet (BN={bn}) from server.")
                     print("[!] Delaying the transmission for 25 seconds\n")
 
-                    time.sleep(25)
-                    print("[!] 25 seconds passed.")
+                    packet_to_delay = response
+                    start_time = time.time()
                     data_delayed = True
+                    continue
                 
                 if client_address:
+                    time.sleep(0.1)
                     proxy.forward(proxy_to_client_socket,client_address, response)
 def handle_normal_transmission(
     proxy: Proxy,
@@ -916,7 +944,7 @@ def main() -> None:
     initial_proxy_socket.bind((PROXY_IP_CLIENTSIDE, TFTP_PORT))
     proxy_to_server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     proxy_to_server_socket.setsockopt(
-        socket.SOL_SOCKET, 25, str("enp7s0" + "\0").encode("ascii")
+        socket.SOL_SOCKET, 25, str("enp2s0" + "\0").encode("ascii")
     )
     proxy_to_client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
